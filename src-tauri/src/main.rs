@@ -43,6 +43,7 @@ mod resampler;
 mod scrape;
 mod stem_separator;
 mod store;
+mod mtp;
 
 #[cfg(test)]
 mod tests;
@@ -693,7 +694,10 @@ fn main() {
             beets::search_beets,
             beets::search_beets_albums,
             beets::get_beets_album_tracks,
-            beets::get_albums_by_id
+            beets::get_albums_by_id,
+            mtp::mtp_detect_devices,
+            mtp::mtp_get_tracks,
+            mtp::mtp_send_track
         ])
         .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             info!("{}, {argv:?}, {cwd}", app.package_info().name);

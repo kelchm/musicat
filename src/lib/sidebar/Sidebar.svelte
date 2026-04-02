@@ -1664,6 +1664,23 @@
                                     : "currentColor"}
                             />{$LL.sidebar.stats()}</item
                         >
+                        <item
+                            class:selected={$uiView === "zune-sync"}
+                            on:click={() => {
+                                $selectedPlaylistFile = null;
+                                $selectedSmartQuery = null;
+                                $uiView = "zune-sync";
+                                $isSidebarFloating = false;
+                            }}
+                        >
+                            <Icon
+                                icon="mdi:usb"
+                                size={15}
+                                color={$uiView === "zune-sync"
+                                    ? $currentThemeObject["accent"]
+                                    : "currentColor"}
+                            />Zune Sync</item
+                        >
                     </items>
                 </menu>
             </div>
