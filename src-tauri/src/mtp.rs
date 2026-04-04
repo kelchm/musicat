@@ -7,7 +7,7 @@
 use bytes::Bytes;
 use futures_util::stream;
 use log::info;
-use mtp_rs::mtp::{MtpDevice, MtpDeviceInfo, NewObjectInfo};
+use mtp_rs::mtp::{DeviceQuirks, MtpDevice, MtpDeviceInfo, NewObjectInfo};
 use mtp_rs::ptp::{
     unpack_string, unpack_u16, unpack_u32, ObjectFormatCode, ObjectHandle, ObjectPropertyCode,
 };
@@ -20,6 +20,23 @@ use tauri::Emitter;
 use tokio::sync::Mutex;
 
 use crate::mtpz;
+
+// ─── Zune device identification ─────────────────────────────────────────
+// Microsoft Zune VID/PIDs — these devices use non-standard USB descriptors
+// and require split header/data mode + manual folder traversal.
+
+const ZUNE_QUIRKS: DeviceQuirks = DeviceQuirks {
+    split_header_data: true,
+    manual_traversal: true,
+};
+
+const ZUNE_DEVICES: &[(u16, u16)] = &[
+    (0x045E, 0x0710), // Zune
+    (0x045E, 0x0711), // Zune
+    (0x045E, 0x0712), // Zune
+    (0x045E, 0x063E), // Zune HD
+    (0x045E, 0x0714), // Zune (alt)
+];
 
 // ─── Standard MTP object property codes for music metadata ────────────────
 // See MTP spec §5.3.12 — these work on any compliant MTP device.
@@ -127,8 +144,13 @@ async fn get_device(serial: &str) -> Result<MtpDevice, String> {
         }
     }
 
-    // Open new connection
-    let device = MtpDevice::open_by_serial(serial)
+    // Open new connection — register Zune devices so they get the right quirks
+    let mut builder = MtpDevice::builder();
+    for &(vid, pid) in ZUNE_DEVICES {
+        builder = builder.register_device(vid, pid, ZUNE_QUIRKS.clone());
+    }
+    let device = builder
+        .open_by_serial(serial)
         .await
         .map_err(|e| format!("Failed to open device: {}", e))?;
 
@@ -202,7 +224,7 @@ fn is_audio_format(format: ObjectFormatCode) -> bool {
 #[tauri::command]
 pub async fn mtp_detect_devices() -> Result<Vec<MtpDeviceDesc>, String> {
     tokio::task::spawn_blocking(|| {
-        MtpDevice::list_devices()
+        MtpDevice::list_devices_with_known(ZUNE_DEVICES)
             .map(|devices| devices.iter().map(MtpDeviceDesc::from).collect())
             .map_err(|e| format!("Device detection failed: {}", e))
     })
