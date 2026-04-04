@@ -79,6 +79,7 @@
     import QueueView from "./lib/views/QueueView.svelte";
     import TopBar from "./lib/views/TopBar.svelte";
     import WikiView from "./lib/views/WikiView.svelte";
+    import ZuneSyncView from "./lib/zune-sync/ZuneSyncView.svelte";
     import ThemeWrapper from "./theming/ThemeWrapper.svelte";
     import {
         startErrorListener,
@@ -536,6 +537,8 @@
                         <InternetArchiveView />
                     {:else if $uiView === "prune"}
                         <PrunePopup />
+                    {:else if $uiView === "zune-sync"}
+                        <ZuneSyncView />
                     {:else if $uiView === "queue"}<QueueView autoWidth={true} />
                     {:else if $uiView === "wiki"}
                         <div

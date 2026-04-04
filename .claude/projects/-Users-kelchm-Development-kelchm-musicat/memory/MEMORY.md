@@ -1,0 +1,1 @@
+- [MTP/Zune sync status](project_mtp_zune.md) — Working Zune MTPZ handshake + track listing with play counts on macOS via pure Rust
