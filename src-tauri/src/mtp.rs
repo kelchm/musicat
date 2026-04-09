@@ -61,6 +61,10 @@ const OPC_DURATION: ObjectPropertyCode = ObjectPropertyCode::Unknown(0xDC89);
 const OPC_USE_COUNT: ObjectPropertyCode = ObjectPropertyCode::Unknown(0xDC91);
 /// ArtistId — links a track or album object to an Artist object (uint32 handle)
 const OPC_ARTIST_ID: ObjectPropertyCode = ObjectPropertyCode::Unknown(0xDAB9);
+/// RepresentativeSampleData — raw image bytes for album art (byte array)
+const OPC_REP_SAMPLE_DATA: ObjectPropertyCode = ObjectPropertyCode::Unknown(0xDC86);
+/// RepresentativeSampleFormat — image format code (u16, 0x3801 = JPEG)
+const OPC_REP_SAMPLE_FORMAT: ObjectPropertyCode = ObjectPropertyCode::Unknown(0xDC81);
 
 /// Object format for an Artist metadata object (Zune extension).
 const OFC_ARTIST: u16 = 0xB218;
@@ -393,10 +397,9 @@ pub async fn mtp_send_track(
         .next()
         .ok_or_else(|| "No storage found on device".to_string())?;
 
-    // Find or create a Music folder to upload into.
-    // Many devices (especially Android) reject uploads to the storage root.
-    let music_folder = find_or_create_music_folder(&device, &storage).await?;
-
+    // Upload to storage root — the Zune indexes tracks from the root and
+    // zune-explorer also uploads to parentHandle=0. Android devices prefer
+    // a Music subfolder, but Zune doesn't need one.
     let obj_info = NewObjectInfo::file(filename, file_size);
 
     // Create a stream from the file data
@@ -406,7 +409,7 @@ pub async fn mtp_send_track(
     let app = app_handle.clone();
 
     let handle = storage
-        .upload_with_progress(Some(music_folder), obj_info, data_stream, move |progress: Progress| {
+        .upload_with_progress(None, obj_info, data_stream, move |progress: Progress| {
             let percent = progress.percent();
             let total = progress.total_bytes.unwrap_or(file_size);
             let _ = app.emit(
@@ -430,6 +433,9 @@ pub async fn mtp_send_track(
         set_track_metadata(&device, handle, &event).await;
     }
 
+    // Find album art: embedded in file tags, or a cover image in the same folder.
+    let album_art = find_album_art(file_path);
+
     // Maintain abstract Artist/AbstractAudioAlbum objects for library grouping.
     // The Zune (and other Microsoft media devices) require these to display
     // tracks under the right artist/album in the UI; per-track string props
@@ -441,6 +447,7 @@ pub async fn mtp_send_track(
         &event.artist,
         &event.album,
         &event.serial_number,
+        album_art.as_ref(),
     )
     .await
     {
@@ -513,6 +520,7 @@ async fn ensure_album_grouping(
     artist_name: &str,
     album_name: &str,
     serial: &str,
+    album_art: Option<&AlbumArt>,
 ) -> Result<(), String> {
     // Skip if either is empty/Unknown — there's nothing meaningful to group by.
     if artist_name.is_empty() || album_name.is_empty() {
@@ -522,53 +530,13 @@ async fn ensure_album_grouping(
     let session = device.session();
     let storage_id = storage.id();
 
-    // ── 1. Get-or-create the Artist object ─────────────────────────────
-    let artist_handle = {
-        let holder = device_holder();
-        let mut guard = holder.lock().await;
-        let conn = guard
-            .as_mut()
-            .filter(|c| c.serial == serial)
-            .ok_or_else(|| "Cached device connection missing".to_string())?;
+    // Note: Artist objects (0xB218) are NOT created — the Zune rejects
+    // SendObjectInfo for that format with InvalidObjectFormatCode (0x2016).
+    // zune-explorer also fails to create them (confirmed via wire logs).
+    // The Zune's library view works with just the AbstractAudioAlbum object
+    // plus its Name, Artist string, and track references.
 
-        if let Some(h) = conn.artist_handles.get(artist_name) {
-            *h
-        } else {
-            // Drop the lock before doing slow MTP operations.
-            drop(guard);
-
-            let artist_filename = format!("{}.art", artist_name);
-            let h = send_abstract_object(
-                session,
-                storage_id,
-                ObjectHandle(0),
-                OFC_ARTIST,
-                &artist_filename,
-            )
-            .await
-            .map_err(|e| format!("Failed to create Artist object: {}", e))?;
-
-            // Set the Name property on the artist object.
-            if let Err(e) = session
-                .set_object_prop_value(h, OPC_NAME, &pack_string(artist_name))
-                .await
-            {
-                info!("Could not set artist Name property: {}", e);
-            }
-
-            // Cache it.
-            let holder = device_holder();
-            let mut guard = holder.lock().await;
-            if let Some(conn) = guard.as_mut().filter(|c| c.serial == serial) {
-                conn.artist_handles.insert(artist_name.to_string(), h);
-            }
-
-            info!("Created Artist object \"{}\" handle={}", artist_name, h.0);
-            h
-        }
-    };
-
-    // ── 2. Get-or-create the AbstractAudioAlbum object ─────────────────
+    // ── 1. Get-or-create the AbstractAudioAlbum object ────────────────
     let group_key = format!("{}|||{}", artist_name, album_name);
 
     let (album_handle, all_track_handles) = {
@@ -598,7 +566,7 @@ async fn ensure_album_grouping(
             .await
             .map_err(|e| format!("Failed to create Album object: {}", e))?;
 
-            // Set Name + Artist (string) + ArtistId on the album.
+            // Set Name + Artist string on the album.
             if let Err(e) = session
                 .set_object_prop_value(album_handle, OPC_NAME, &pack_string(album_name))
                 .await
@@ -611,15 +579,39 @@ async fn ensure_album_grouping(
             {
                 info!("Could not set album Artist: {}", e);
             }
-            if let Err(e) = session
-                .set_object_prop_value(
-                    album_handle,
-                    OPC_ARTIST_ID,
-                    &artist_handle.0.to_le_bytes(),
-                )
-                .await
-            {
-                info!("Could not set album ArtistId: {}", e);
+
+            // Set album art if available. The Zune reads RepresentativeSampleData
+            // on the AbstractAudioAlbum object for the library/album art view.
+            if let Some(art) = album_art {
+                // MTP byte array: 4-byte LE length prefix + raw bytes
+                let mut payload = Vec::with_capacity(4 + art.data.len());
+                payload.extend_from_slice(&(art.data.len() as u32).to_le_bytes());
+                payload.extend_from_slice(&art.data);
+
+                if let Err(e) = session
+                    .set_object_prop_value(album_handle, OPC_REP_SAMPLE_DATA, &payload)
+                    .await
+                {
+                    info!("Could not set album art data: {}", e);
+                }
+
+                // Format = JPEG (0x3801)
+                if let Err(e) = session
+                    .set_object_prop_value(
+                        album_handle,
+                        OPC_REP_SAMPLE_FORMAT,
+                        &0x3801u16.to_le_bytes(),
+                    )
+                    .await
+                {
+                    info!("Could not set album art format: {}", e);
+                }
+
+                info!(
+                    "Set album art on \"{}\" ({} bytes)",
+                    album_name,
+                    art.data.len(),
+                );
             }
 
             // Insert the new group into the cache.
@@ -629,7 +621,7 @@ async fn ensure_album_grouping(
                 conn.album_groups.insert(
                     group_key.clone(),
                     AlbumGroup {
-                        artist_handle,
+                        artist_handle: ObjectHandle(0),
                         album_handle,
                         track_handles: vec![track_handle],
                     },
@@ -645,15 +637,7 @@ async fn ensure_album_grouping(
         }
     };
 
-    // ── 3. Set ArtistId on the new track itself ────────────────────────
-    if let Err(e) = session
-        .set_object_prop_value(track_handle, OPC_ARTIST_ID, &artist_handle.0.to_le_bytes())
-        .await
-    {
-        info!("Could not set ArtistId on track: {}", e);
-    }
-
-    // ── 4. Update SetObjectReferences on the album to include all tracks ──
+    // ── 2. Update SetObjectReferences on the album to include all tracks ──
     // The Zune library view scans these references to populate the album.
     // We re-issue this on every new track because we don't know in advance
     // when the user will stop adding to this album.
@@ -664,17 +648,85 @@ async fn ensure_album_grouping(
     Ok(())
 }
 
-/// Create an abstract (zero-data) object on the device by manually marshalling
-/// the SendObjectInfo dataset. We can't use `Storage::upload` for this because
-/// mtp-rs's `ObjectInfo::to_bytes` writes a 19-field dataset including a
-/// trailing `Keywords` string field, which the Zune rejects with
-/// `InvalidObjectFormatCode (0x2016)` for non-file formats like Artist
-/// (0xB218) and AbstractAudioAlbum (0xBA03). NiceBeard's working implementation
-/// uses the standard MTP 1.1 18-field layout (no Keywords). We mirror that here.
-///
-/// Wire format (MTP 1.1 §5.5.4):
-///   command params: [storage_id, parent_handle]
-///   data phase: 52-byte fixed header + filename string + creationDate + modificationDate
+/// Album art data ready to send to a device.
+struct AlbumArt {
+    data: Vec<u8>,
+}
+
+/// Find album art for a track: first try embedded art in the file's tags,
+/// then look for common cover art files in the same directory.
+fn find_album_art(path: &Path) -> Option<AlbumArt> {
+    // 1. Try embedded art
+    if let Some(art) = extract_embedded_art(path) {
+        return Some(art);
+    }
+
+    // 2. Try folder art (cover.jpg, folder.jpg, etc.)
+    let dir = path.parent()?;
+    const CANDIDATES: &[&str] = &[
+        "cover.jpg",
+        "cover.jpeg",
+        "folder.jpg",
+        "folder.jpeg",
+        "front.jpg",
+        "front.jpeg",
+        "album.jpg",
+        "album.jpeg",
+        "artwork.jpg",
+        "artwork.jpeg",
+        "Cover.jpg",
+        "Folder.jpg",
+    ];
+
+    for name in CANDIDATES {
+        let art_path = dir.join(name);
+        if art_path.exists() {
+            if let Ok(data) = std::fs::read(&art_path) {
+                info!("Using folder art: {} ({} bytes)", art_path.display(), data.len());
+                return Some(AlbumArt { data });
+            }
+        }
+    }
+
+    // 3. Fall back to first .jpg/.jpeg in the directory
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
+                    if let Ok(data) = std::fs::read(&p) {
+                        info!("Using folder art (fallback): {} ({} bytes)", p.display(), data.len());
+                        return Some(AlbumArt { data });
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract embedded album art from audio file tags.
+fn extract_embedded_art(path: &Path) -> Option<AlbumArt> {
+    use lofty::file::TaggedFileExt;
+
+    let tagged_file = lofty::read_from_path(path).ok()?;
+    let tag = tagged_file.primary_tag()?;
+    let pic = tag.pictures().first()?;
+    info!(
+        "Using embedded art: {} bytes, mime={:?}",
+        pic.data().len(),
+        pic.mime_type()
+    );
+    Some(AlbumArt {
+        data: pic.data().to_vec(),
+    })
+}
+
+/// Create an abstract (zero-data) object on the device using the standard
+/// mtp-rs ObjectInfo path (19-field dataset). This is the same serialization
+/// that `Storage::upload` uses for regular file transfers — and since the Zune
+/// accepts it for audio files, it should work for abstract formats too.
 async fn send_abstract_object(
     session: &mtp_rs::ptp::PtpSession,
     storage_id: mtp_rs::ptp::StorageId,
@@ -682,55 +734,44 @@ async fn send_abstract_object(
     object_format: u16,
     filename: &str,
 ) -> Result<ObjectHandle, String> {
-    use mtp_rs::ptp::OperationCode;
+    use mtp_rs::ptp::{pack_string, OperationCode};
 
-    // Build the 18-field dataset.
+    // Build an 18-field dataset matching exactly what zune-explorer produces:
+    // storageId=0 in dataset (real value goes in command params only),
+    // no Keywords field.
     let filename_bytes = pack_string(filename);
-    let empty_string = [0x00u8]; // MTP empty string = single zero byte
+    let empty_string = [0x00u8];
 
     let fixed_size = 52;
     let total_size = fixed_size + filename_bytes.len() + empty_string.len() * 2;
     let mut buf = Vec::with_capacity(total_size);
 
-    // 1. StorageID (u32)
-    buf.extend_from_slice(&storage_id.0.to_le_bytes());
-    // 2. ObjectFormat (u16)
-    buf.extend_from_slice(&object_format.to_le_bytes());
-    // 3. ProtectionStatus (u16) = 0
-    buf.extend_from_slice(&0u16.to_le_bytes());
-    // 4. ObjectCompressedSize (u32) = 0 (abstract object has no data)
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    // 5. ThumbFormat (u16) = 0
-    buf.extend_from_slice(&0u16.to_le_bytes());
-    // 6. ThumbCompressedSize (u32) = 0
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    // 7. ThumbPixWidth (u32) = 0
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    // 8. ThumbPixHeight (u32) = 0
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    // 9. ImagePixWidth (u32) = 0
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    // 10. ImagePixHeight (u32) = 0
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    // 11. ImageBitDepth (u32) = 0
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    // 12. ParentObject (u32)
-    buf.extend_from_slice(&parent_handle.0.to_le_bytes());
-    // 13. AssociationType (u16) = 0
-    buf.extend_from_slice(&0u16.to_le_bytes());
-    // 14. AssociationDesc (u32) = 0
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    // 15. SequenceNumber (u32) = 0
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    // 16. Filename (MTP string)
-    buf.extend_from_slice(&filename_bytes);
-    // 17. CreationDate (empty MTP string)
-    buf.extend_from_slice(&empty_string);
-    // 18. ModificationDate (empty MTP string)
-    buf.extend_from_slice(&empty_string);
-    // (NO Keywords field — that's where mtp-rs and the Zune disagree)
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 1. StorageID = 0 (authoritative value is in cmd params)
+    buf.extend_from_slice(&object_format.to_le_bytes()); // 2. ObjectFormat
+    buf.extend_from_slice(&0u16.to_le_bytes()); // 3. ProtectionStatus
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 4. CompressedSize
+    buf.extend_from_slice(&0u16.to_le_bytes()); // 5. ThumbFormat
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 6. ThumbCompressedSize
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 7. ThumbPixWidth
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 8. ThumbPixHeight
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 9. ImagePixWidth
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 10. ImagePixHeight
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 11. ImageBitDepth
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 12. ParentObject = 0
+    buf.extend_from_slice(&0u16.to_le_bytes()); // 13. AssociationType
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 14. AssociationDesc
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 15. SequenceNumber
+    buf.extend_from_slice(&filename_bytes);      // 16. Filename
+    buf.extend_from_slice(&empty_string);        // 17. CreationDate (empty)
+    buf.extend_from_slice(&empty_string);        // 18. ModificationDate (empty)
 
-    // Send SendObjectInfo command + data phase.
+    info!(
+        "SendObjectInfo dataset for format 0x{:04x}: {} bytes = {}",
+        object_format,
+        buf.len(),
+        hex::encode(&buf)
+    );
+
     let response = session
         .execute_with_send(
             OperationCode::SendObjectInfo,
@@ -741,6 +782,10 @@ async fn send_abstract_object(
         .map_err(|e| format!("SendObjectInfo failed: {}", e))?;
 
     let resp_code = u16::from(response.code);
+    info!(
+        "SendObjectInfo response: 0x{:04x} params={:?}",
+        resp_code, response.params
+    );
     if resp_code != 0x2001 {
         return Err(format!(
             "SendObjectInfo returned 0x{:04x} for format 0x{:04x}",
@@ -748,15 +793,12 @@ async fn send_abstract_object(
         ));
     }
 
-    // Response params: [storage_id, parent_handle, new_object_handle]
     let new_handle_raw = *response
         .params
         .get(2)
         .ok_or_else(|| "SendObjectInfo response missing new handle param".to_string())?;
     let new_handle = ObjectHandle(new_handle_raw);
 
-    // Send SendObject with empty data — required by the protocol even for
-    // zero-byte objects.
     session
         .execute_with_send(OperationCode::SendObject, &[], &[])
         .await

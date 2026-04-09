@@ -145,8 +145,7 @@ fn aes_cbc_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Compute AES-CMAC (RFC 4493) of `message` using `key`.
 fn aes_cmac(key: &[u8], message: &[u8]) -> [u8; 16] {
-    let mut mac =
-        Cmac::<Aes128>::new_from_slice(key).expect("CMAC key must be 16 bytes");
+    let mut mac = Cmac::<Aes128>::new_from_slice(key).expect("CMAC key must be 16 bytes");
     mac.update(message);
     mac.finalize().into_bytes().into()
 }
@@ -184,7 +183,7 @@ pub async fn perform_handshake(device: &MtpDevice) -> Result<(), String> {
     // (the original reverse-engineered identifier) — anything else causes the
     // device to silently downgrade the session and reject write operations
     // with AccessDenied while still allowing reads.
-    let initiator_str = pack_string("libmtp/Sajid Anwar - MTPZClassDriver");
+    let initiator_str = pack_string("libmtp/musicat - MTPZClassDriver");
     match session
         .set_device_prop_value(DPC_SESSION_INITIATOR_INFO, &initiator_str)
         .await
@@ -245,12 +244,22 @@ pub async fn perform_handshake(device: &MtpDevice) -> Result<(), String> {
 
     let confirmation = build_confirmation(&hash);
 
-    session
+    let confirm_resp = session
         .execute_with_send(PTP_OC_SEND_WMDRMPD_APP_REQUEST, &[], &confirmation)
         .await
         .map_err(|e| format!("Failed to send confirmation: {}", e))?;
 
-    info!("Sent handshake confirmation");
+    let confirm_code = u16::from(confirm_resp.code);
+    info!(
+        "Sent handshake confirmation (response: 0x{:04x})",
+        confirm_code
+    );
+    if confirm_code != 0x2001 {
+        return Err(format!(
+            "Handshake confirmation rejected with 0x{:04x}",
+            confirm_code
+        ));
+    }
 
     // ── Phase 4: Enable trusted file operations ────────────────────────
 
@@ -283,10 +292,22 @@ pub async fn perform_handshake(device: &MtpDevice) -> Result<(), String> {
         u32::from_be_bytes([mch[12], mch[13], mch[14], mch[15]]),
     ];
 
-    session
+    let enable_resp = session
         .execute(PTP_OC_ENABLE_TRUSTED_FILES_OPS, &params)
         .await
         .map_err(|e| format!("Failed to enable trusted ops: {}", e))?;
+
+    let enable_code = u16::from(enable_resp.code);
+    info!(
+        "EnableTrustedFileOperations response: 0x{:04x} (params: [{:08x}, {:08x}, {:08x}, {:08x}])",
+        enable_code, params[0], params[1], params[2], params[3]
+    );
+    if enable_code != 0x2001 {
+        return Err(format!(
+            "EnableTrustedFileOperations failed with 0x{:04x} — MTPZ handshake incomplete",
+            enable_code
+        ));
+    }
 
     info!("MTPZ handshake complete — trusted file operations enabled");
     Ok(())
@@ -670,4 +691,3 @@ fn build_confirmation(hash: &[u8]) -> Vec<u8> {
 
     message
 }
-

@@ -79,7 +79,7 @@ serde_bytes = "0.11.17"
 memmap2 = "0.9.7"
 strum = "0.27.2"
 rusqlite = { version = "0.38.0", features = ["bundled"] }
-mtp-rs = { path = "../../mtp-rs" }
+mtp-rs = "0.10.0"
 num-bigint-dig = "0.8"
 num-traits = "0.2"
 aes = "0.8"
