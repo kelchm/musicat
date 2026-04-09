@@ -7,8 +7,9 @@
 //
 // Protocol reference: https://github.com/kbhomes/libmtp-zune
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
 use aes::Aes128;
+use cmac::{Cmac, Mac};
 use log::info;
 use mtp_rs::mtp::MtpDevice;
 use mtp_rs::ptp::{pack_string, DevicePropertyCode, OperationCode};
@@ -128,86 +129,26 @@ fn rsa_decrypt(input: &[u8], d: &BigUint, n: &BigUint) -> Vec<u8> {
 // ─── AES-128-CBC ──────────────────────────────────────────────────────────
 
 fn aes_cbc_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
-    if key.len() != 16 {
-        return Err("AES key must be 16 bytes".into());
-    }
     if data.len() % 16 != 0 {
         return Err(format!(
             "AES data length {} not a multiple of 16",
             data.len()
         ));
     }
-
-    let cipher = Aes128::new(key.into());
-    let mut plaintext = Vec::with_capacity(data.len());
-    let mut prev_block = [0u8; 16]; // IV = all zeros
-
-    for chunk in data.chunks(16) {
-        let mut block = aes::Block::clone_from_slice(chunk);
-        cipher.decrypt_block(&mut block);
-
-        // CBC: XOR with previous ciphertext block
-        let decrypted: Vec<u8> = block
-            .iter()
-            .zip(prev_block.iter())
-            .map(|(a, b)| a ^ b)
-            .collect();
-        plaintext.extend_from_slice(&decrypted);
-        prev_block.copy_from_slice(chunk);
-    }
-
-    Ok(plaintext)
+    let mut buf = data.to_vec();
+    cbc::Decryptor::<Aes128>::new_from_slices(key, &[0u8; 16])
+        .map_err(|e| format!("AES init: {}", e))?
+        .decrypt_padded_mut::<NoPadding>(&mut buf)
+        .map_err(|e| format!("AES-CBC decrypt: {}", e))?;
+    Ok(buf)
 }
 
-fn aes_ecb_encrypt_block(key: &[u8], block: &[u8; 16]) -> [u8; 16] {
-    let cipher = Aes128::new(key.into());
-    let mut out = aes::Block::clone_from_slice(block);
-    cipher.encrypt_block(&mut out);
-    out.into()
-}
-
-// ─── CMAC (RFC 4493) ─────────────────────────────────────────────────────
-
-/// Left-shift a 16-byte block by 1 bit, XOR with 0x87 if MSB was set.
-fn cmac_shift(block: &[u8; 16]) -> [u8; 16] {
-    let msb = block[0] & 0x80 != 0;
-    let mut out = [0u8; 16];
-    for i in 0..15 {
-        out[i] = (block[i] << 1) | (block[i + 1] >> 7);
-    }
-    out[15] = block[15] << 1;
-    if msb {
-        out[15] ^= 0x87;
-    }
-    out
-}
-
-/// Compute AES-CMAC of `message` using `key`.
+/// Compute AES-CMAC (RFC 4493) of `message` using `key`.
 fn aes_cmac(key: &[u8], message: &[u8]) -> [u8; 16] {
-    let zeros = [0u8; 16];
-    let l = aes_ecb_encrypt_block(key, &zeros);
-    let k1 = cmac_shift(&l);
-
-    // For complete blocks (message length is multiple of 16 and > 0)
-    let mut block = [0u8; 16];
-    if message.len() == 16 {
-        // XOR message with K1
-        for i in 0..16 {
-            block[i] = message[i] ^ k1[i];
-        }
-    } else {
-        // Pad with 0x80 and zeros, XOR with K2
-        let k2 = cmac_shift(&k1);
-        let mut padded = [0u8; 16];
-        padded[..message.len()].copy_from_slice(message);
-        padded[message.len()] = 0x80;
-        for i in 0..16 {
-            block[i] = padded[i] ^ k2[i];
-        }
-    }
-
-    // Single-block CBC: encrypt the XORed block
-    aes_ecb_encrypt_block(key, &block)
+    let mut mac =
+        Cmac::<Aes128>::new_from_slice(key).expect("CMAC key must be 16 bytes");
+    mac.update(message);
+    mac.finalize().into_bytes().into()
 }
 
 // ─── Handshake implementation ─────────────────────────────────────────────
@@ -730,85 +671,3 @@ fn build_confirmation(hash: &[u8]) -> Vec<u8> {
     message
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Helper: parse a hex string into bytes
-    fn h(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
-    }
-
-    /// RFC 4493 AES-CMAC test vectors.
-    ///
-    /// All vectors use the same key K = 2b7e151628aed2a6abf7158809cf4f3c.
-    /// We test the two vectors that fall within our aes_cmac function's
-    /// supported input range (empty message, and 16-byte message). The longer
-    /// vectors require multi-block CMAC which our implementation doesn't
-    /// support — and intentionally so, since MTPZ only ever feeds it 4-byte
-    /// and 16-byte messages.
-    #[test]
-    fn rfc4493_test_vector_empty_message() {
-        let key = h("2b7e151628aed2a6abf7158809cf4f3c");
-        let msg: Vec<u8> = Vec::new();
-        let expected = h("bb1d6929e95937287fa37d129b756746");
-        let actual = aes_cmac(&key, &msg);
-        assert_eq!(
-            actual.to_vec(),
-            expected,
-            "RFC 4493 test vector 1 (empty message) failed.\n  expected: {}\n  actual:   {}",
-            hex::encode(&expected),
-            hex::encode(actual)
-        );
-    }
-
-    #[test]
-    fn rfc4493_test_vector_16_byte_message() {
-        let key = h("2b7e151628aed2a6abf7158809cf4f3c");
-        let msg = h("6bc1bee22e409f96e93d7e117393172a");
-        let expected = h("070a16b46b4d4144f79bdd9dd04a287c");
-        let actual = aes_cmac(&key, &msg);
-        assert_eq!(
-            actual.to_vec(),
-            expected,
-            "RFC 4493 test vector 2 (16-byte message) failed.\n  expected: {}\n  actual:   {}",
-            hex::encode(&expected),
-            hex::encode(actual)
-        );
-    }
-
-    /// Verify our cmac_shift matches the RFC 4493 K1/K2 derivation steps.
-    /// From RFC 4493 §2.4 (Subkey Generation Algorithm):
-    /// L  = 7df76b0c1ab899b33e42f047b91b546f   (AES_K(0^128))
-    /// K1 = fbeed618357133667c85e08f7236a8de
-    /// K2 = f7ddac306ae266ccf90bc11ee46d513b
-    #[test]
-    fn rfc4493_subkey_derivation() {
-        let key = h("2b7e151628aed2a6abf7158809cf4f3c");
-        let zeros = [0u8; 16];
-
-        let l = aes_ecb_encrypt_block(&key, &zeros);
-        assert_eq!(
-            hex::encode(&l),
-            "7df76b0c1ab899b33e42f047b91b546f",
-            "L (AES_K(0^128)) does not match RFC 4493"
-        );
-
-        let k1 = cmac_shift(&l);
-        assert_eq!(
-            hex::encode(&k1),
-            "fbeed618357133667c85e08f7236a8de",
-            "K1 does not match RFC 4493"
-        );
-
-        let k2 = cmac_shift(&k1);
-        assert_eq!(
-            hex::encode(&k2),
-            "f7ddac306ae266ccf90bc11ee46d513b",
-            "K2 does not match RFC 4493"
-        );
-    }
-}

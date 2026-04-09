@@ -83,6 +83,8 @@ mtp-rs = { path = "../../mtp-rs" }
 num-bigint-dig = "0.8"
 num-traits = "0.2"
 aes = "0.8"
+cbc = "0.1"
+cmac = "0.7"
 sha1 = "0.10"
 rand = "0.8"
 hex = "0.4"
