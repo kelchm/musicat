@@ -256,7 +256,8 @@ type UiView =
     | "to-delete"
     /* Only in compact mode - see isCompactView */
     | "queue"
-    | "wiki";
+    | "wiki"
+    | "zune-sync";
 
 type ArtistContentItem = ArtistFileItem | ArtistLinkItem;
 
