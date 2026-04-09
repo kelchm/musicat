@@ -698,7 +698,8 @@ fn main() {
             beets::get_albums_by_id,
             mtp::mtp_detect_devices,
             mtp::mtp_get_tracks,
-            mtp::mtp_send_track
+            mtp::mtp_send_track,
+            mtp::mtp_disconnect
         ])
         .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             info!("{}, {argv:?}, {cwd}", app.package_info().name);

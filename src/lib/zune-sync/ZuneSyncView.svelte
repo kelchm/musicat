@@ -52,6 +52,8 @@
 
     let unlistenProgress: UnlistenFn | null = null;
 
+    let beforeUnloadHandler: ((e: BeforeUnloadEvent) => void) | null = null;
+
     onMount(async () => {
         localSongs = await db.songs
             .filter((s) => s.path.toLowerCase().endsWith(".mp3"))
@@ -63,11 +65,46 @@
                 transferProgress = event.payload;
             }
         );
+
+        // Best-effort: close the MTP session if the app is about to unload.
+        // This catches window-close and reload paths that bypass onDestroy.
+        beforeUnloadHandler = () => {
+            if (selectedDevice) {
+                invoke("mtp_disconnect", {
+                    serialNumber: selectedDevice.serialNumber,
+                }).catch(() => {});
+            }
+        };
+        window.addEventListener("beforeunload", beforeUnloadHandler);
     });
 
     onDestroy(() => {
         unlistenProgress?.();
+        if (beforeUnloadHandler) {
+            window.removeEventListener("beforeunload", beforeUnloadHandler);
+            beforeUnloadHandler = null;
+        }
+        // Cleanly close the MTP session so the device's "Syncing" UI returns
+        // to its idle state. Without this, the Zune stays stuck on the
+        // syncing screen until the USB cable is unplugged.
+        if (selectedDevice) {
+            invoke("mtp_disconnect", {
+                serialNumber: selectedDevice.serialNumber,
+            }).catch(() => {});
+        }
     });
+
+    async function disconnectCurrentDevice() {
+        if (!selectedDevice) return;
+        try {
+            await invoke("mtp_disconnect", {
+                serialNumber: selectedDevice.serialNumber,
+            });
+        } catch (e) {
+            // Best-effort: log but don't surface to the user
+            console.warn("mtp_disconnect failed:", e);
+        }
+    }
 
     async function detectDevices() {
         detecting = true;
@@ -89,6 +126,11 @@
     }
 
     async function selectDevice(device: MtpDevice) {
+        // If we're switching from a previously-selected device, close that
+        // session first so the old device's Syncing screen clears.
+        if (selectedDevice && selectedDevice.serialNumber !== device.serialNumber) {
+            await disconnectCurrentDevice();
+        }
         selectedDevice = device;
         await loadDeviceTracks();
     }

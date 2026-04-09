@@ -11,7 +11,7 @@ use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes128;
 use log::info;
 use mtp_rs::mtp::MtpDevice;
-use mtp_rs::ptp::{DevicePropertyCode, OperationCode, pack_string};
+use mtp_rs::ptp::{pack_string, DevicePropertyCode, OperationCode};
 use num_bigint_dig::BigUint;
 use sha1::{Digest, Sha1};
 use std::fs;
@@ -32,10 +32,10 @@ const DPC_SESSION_INITIATOR_INFO: DevicePropertyCode = DevicePropertyCode::Unkno
 /// MTPZ credentials loaded from ~/.mtpz-data
 struct MtpzCredentials {
     _public_exponent: BigUint,
-    _encryption_key: Vec<u8>,  // 16 bytes — used by protocol but key derivation happens in response
+    _encryption_key: Vec<u8>, // 16 bytes — used by protocol but key derivation happens in response
     modulus: BigUint,
     private_key: BigUint,
-    certificates: Vec<u8>,     // 629 bytes
+    certificates: Vec<u8>, // 629 bytes
 }
 
 impl MtpzCredentials {
@@ -46,19 +46,22 @@ impl MtpzCredentials {
 
         let lines: Vec<&str> = content.lines().collect();
         if lines.len() < 5 {
-            return Err(format!("~/.mtpz-data has {} lines, expected 5", lines.len()));
+            return Err(format!(
+                "~/.mtpz-data has {} lines, expected 5",
+                lines.len()
+            ));
         }
 
         let _public_exponent = BigUint::parse_bytes(lines[0].trim().as_bytes(), 16)
             .ok_or("Invalid public exponent hex")?;
         let _encryption_key = hex::decode(lines[1].trim())
             .map_err(|e| format!("Invalid encryption key hex: {}", e))?;
-        let modulus = BigUint::parse_bytes(lines[2].trim().as_bytes(), 16)
-            .ok_or("Invalid modulus hex")?;
+        let modulus =
+            BigUint::parse_bytes(lines[2].trim().as_bytes(), 16).ok_or("Invalid modulus hex")?;
         let private_key = BigUint::parse_bytes(lines[3].trim().as_bytes(), 16)
             .ok_or("Invalid private key hex")?;
-        let certificates = hex::decode(lines[4].trim())
-            .map_err(|e| format!("Invalid certificates hex: {}", e))?;
+        let certificates =
+            hex::decode(lines[4].trim()).map_err(|e| format!("Invalid certificates hex: {}", e))?;
 
         if _encryption_key.len() != 16 {
             return Err(format!(
@@ -129,7 +132,10 @@ fn aes_cbc_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
         return Err("AES key must be 16 bytes".into());
     }
     if data.len() % 16 != 0 {
-        return Err(format!("AES data length {} not a multiple of 16", data.len()));
+        return Err(format!(
+            "AES data length {} not a multiple of 16",
+            data.len()
+        ));
     }
 
     let cipher = Aes128::new(key.into());
@@ -141,7 +147,11 @@ fn aes_cbc_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
         cipher.decrypt_block(&mut block);
 
         // CBC: XOR with previous ciphertext block
-        let decrypted: Vec<u8> = block.iter().zip(prev_block.iter()).map(|(a, b)| a ^ b).collect();
+        let decrypted: Vec<u8> = block
+            .iter()
+            .zip(prev_block.iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
         plaintext.extend_from_slice(&decrypted);
         prev_block.copy_from_slice(chunk);
     }
@@ -221,11 +231,19 @@ pub async fn perform_handshake(device: &MtpDevice) -> Result<(), String> {
     info!("Starting MTPZ handshake...");
     info!("Vendor extension: {}", di.vendor_extension_desc);
     info!("Supported ops: {:?}", di.operations_supported);
-    info!("Device props supported: {:?}", di.device_properties_supported);
+    info!(
+        "Device props supported: {:?}",
+        di.device_properties_supported
+    );
 
     // ── Phase 0: Set session initiator info and reset handshake state ──
 
-    let initiator_str = pack_string("musicat/mtpz-rs");
+    // SessionInitiatorInfo is checked by the Zune firmware against an allowlist
+    // of known MTPZ clients. We must identify ourselves as the libmtp client
+    // (the original reverse-engineered identifier) — anything else causes the
+    // device to silently downgrade the session and reject write operations
+    // with AccessDenied while still allowing reads.
+    let initiator_str = pack_string("libmtp/Sajid Anwar - MTPZClassDriver");
     match session
         .set_device_prop_value(DPC_SESSION_INITIATOR_INFO, &initiator_str)
         .await
@@ -235,16 +253,23 @@ pub async fn perform_handshake(device: &MtpDevice) -> Result<(), String> {
     }
 
     // Reset any prior handshake state (EndTrustedAppSession with no params)
-    let reset_result = session
-        .execute(PTP_OC_END_TRUSTED_APP_SESSION, &[])
-        .await;
-    info!("Reset handshake state: {:?}", reset_result.as_ref().map(|r| r.code));
+    let reset_result = session.execute(PTP_OC_END_TRUSTED_APP_SESSION, &[]).await;
+    info!(
+        "Reset handshake state: {:?}",
+        reset_result.as_ref().map(|r| r.code)
+    );
 
     // ── Phase 1: Build and send application certificate message ────────
 
-    // DEBUG: Use fixed random for reproducibility (remove for production)
+    // Generate a cryptographic-quality random nonce. The Zune embeds this
+    // in the trust handshake; reusing a fixed value across runs may cause
+    // the device to refuse subsequent write operations even though reads
+    // still appear to work. (We previously hard-coded this for debugging
+    // and never reverted it — that's almost certainly the cause of the
+    // AccessDenied we see on SendObjectPropList.)
+    use rand::RngCore;
     let mut random = [0u8; 16];
-    for i in 0..16 { random[i] = i as u8; }
+    rand::thread_rng().fill_bytes(&mut random);
 
     let acm = build_certificate_message(&creds, &random)?;
 
@@ -288,13 +313,27 @@ pub async fn perform_handshake(device: &MtpDevice) -> Result<(), String> {
 
     // ── Phase 4: Enable trusted file operations ────────────────────────
 
+    info!(
+        "MTPZ post-handshake hash: {} bytes = {}",
+        hash.len(),
+        hex::encode(&hash)
+    );
+
     let mac_count_bytes = if hash.len() >= 20 {
         [hash[16], hash[17], hash[18], hash[19]]
     } else {
+        info!(
+            "WARNING: hash is only {} bytes, macCount falling back to zeros — this is the suspected MTPZ bug",
+            hash.len()
+        );
         [0u8; 4]
     };
 
+    info!("MTPZ macCount bytes = {}", hex::encode(&mac_count_bytes));
+
     let mch = aes_cmac(&hash[..16], &mac_count_bytes);
+
+    info!("MTPZ derived params (mch) = {}", hex::encode(&mch));
 
     let params = [
         u32::from_be_bytes([mch[0], mch[1], mch[2], mch[3]]),
@@ -313,7 +352,10 @@ pub async fn perform_handshake(device: &MtpDevice) -> Result<(), String> {
 }
 
 /// Build the 785-byte application certificate message.
-fn build_certificate_message(creds: &MtpzCredentials, random: &[u8; 16]) -> Result<Vec<u8>, String> {
+fn build_certificate_message(
+    creds: &MtpzCredentials,
+    random: &[u8; 16],
+) -> Result<Vec<u8>, String> {
     let cert_len = creds.certificates.len();
     let mut acm = vec![0u8; 7 + cert_len + 2 + 16 + 3 + 128];
 
@@ -456,7 +498,10 @@ fn parse_device_response(
         }
         off + 1 // Skip the 0x80 marker
     } else {
-        return Err(format!("Unexpected response header: {:02X} {:02X}", response[0], response[1]));
+        return Err(format!(
+            "Unexpected response header: {:02X} {:02X}",
+            response[0], response[1]
+        ));
     };
 
     if rsa_offset + 128 > response.len() {
@@ -510,7 +555,7 @@ fn parse_device_response(
 
     // Skip tag + length encoding to get to the actual encrypted data
     data_offset += 1; // skip 0x03 tag
-    // Parse length — could be multi-byte
+                      // Parse length — could be multi-byte
     if data_offset < response.len() && response[data_offset] & 0x80 != 0 {
         let len_bytes = (response[data_offset] & 0x7F) as usize;
         data_offset += 1 + len_bytes;
@@ -531,15 +576,25 @@ fn parse_device_response(
 
     // The plaintext contains certificates, then our random nonce, then device random,
     // then signature, then MAC hash. Search for our nonce to validate.
-    let nonce_found = plaintext
-        .windows(16)
-        .any(|w| w == sent_random);
+    let nonce_found = plaintext.windows(16).any(|w| w == sent_random);
 
     if !nonce_found {
         return Err("Random nonce validation failed — response may be tampered".into());
     }
 
     info!("Nonce validation passed");
+
+    // DIAGNOSTIC: dump the entire decrypted plaintext so we can see all the
+    // length-prefixed fields and verify that extract_mac_hash is picking the
+    // right one for the MAC hash.
+    info!(
+        "MTPZ decrypted response plaintext ({} bytes):",
+        plaintext.len()
+    );
+    for (i, chunk) in plaintext.chunks(32).enumerate() {
+        let hex: Vec<String> = chunk.iter().map(|b| format!("{:02x}", b)).collect();
+        info!("  [{:04x}] {}", i * 32, hex.join(" "));
+    }
 
     // ── Extract MAC hash from end of plaintext ─────────────────────────
 
@@ -552,40 +607,109 @@ fn parse_device_response(
 }
 
 /// Extract the MAC hash from the decrypted device response payload.
-/// Searches for the last length-prefixed field that looks like a hash.
+///
+/// Walks the plaintext as a sequence of length-prefixed fields, matching the
+/// structure used by libmtp-zune's `ptp_mtpz_validatehandshakeresponse` and
+/// NiceBeard's zune-explorer JavaScript port. The structure is:
+///
+///   1. Skip 1 byte (cert section marker)
+///   2. u32 BE certs_length, then <certs_length> bytes (skip)
+///   3. u16 BE rand_length, then <rand_length> bytes (the echoed nonce)
+///   4. u16 BE dev_rand_length, then <dev_rand_length> bytes (skip)
+///   5. Skip 1 byte
+///   6. u16 BE sig_length, then <sig_length> bytes (skip)
+///   7. Skip 1 byte
+///   8. u16 BE machash_length, then <machash_length> bytes — THIS is the hash
 fn extract_mac_hash(plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    // Walk through the plaintext parsing length-prefixed fields from the end.
-    // The MAC hash is typically 16 or 32 bytes at the end.
-    // Look for pattern: marker byte, 0x00, length, then data
+    let mut off: usize = 0;
 
-    // Simple approach: scan backwards for 0x00 0x10 (16 bytes) or 0x00 0x20 (32 bytes)
-    for i in (2..plaintext.len()).rev() {
-        if plaintext[i - 1] == 0x00 && plaintext[i] == 0x20 && i + 32 < plaintext.len() {
-            // 32-byte hash
-            return Ok(plaintext[i + 1..i + 33].to_vec());
+    // Helper to read N bytes safely
+    let read_u16_be = |buf: &[u8], at: usize| -> Result<u16, String> {
+        if at + 2 > buf.len() {
+            return Err(format!("read_u16_be: out of bounds at {}", at));
         }
-        if plaintext[i - 1] == 0x00 && plaintext[i] == 0x10 && i + 16 < plaintext.len() {
-            // Check this isn't just the random nonce marker — the MAC should be later
-            // in the payload. Take the last match.
-            let candidate = plaintext[i + 1..i + 17].to_vec();
-            // Continue scanning to see if there's a later one
-            for j in (i + 17..plaintext.len() - 1).rev() {
-                if plaintext[j] == 0x00 && plaintext[j + 1] == 0x10
-                    && j + 17 < plaintext.len()
-                {
-                    return Ok(plaintext[j + 2..j + 18].to_vec());
-                }
-                if plaintext[j] == 0x00 && plaintext[j + 1] == 0x20
-                    && j + 33 < plaintext.len()
-                {
-                    return Ok(plaintext[j + 2..j + 34].to_vec());
-                }
-            }
-            return Ok(candidate);
+        Ok(u16::from_be_bytes([buf[at], buf[at + 1]]))
+    };
+    let read_u32_be = |buf: &[u8], at: usize| -> Result<u32, String> {
+        if at + 4 > buf.len() {
+            return Err(format!("read_u32_be: out of bounds at {}", at));
         }
+        Ok(u32::from_be_bytes([
+            buf[at],
+            buf[at + 1],
+            buf[at + 2],
+            buf[at + 3],
+        ]))
+    };
+
+    // Step 1: Skip 1 byte cert section marker
+    if plaintext.is_empty() {
+        return Err("plaintext empty".into());
+    }
+    off += 1;
+
+    // Step 2: Skip the certificate section
+    let certs_length = read_u32_be(plaintext, off)? as usize;
+    off += 4;
+    info!(
+        "extract_mac_hash: certs_length = {} (0x{:x}), now at offset 0x{:x}",
+        certs_length, certs_length, off
+    );
+    off = off
+        .checked_add(certs_length)
+        .ok_or_else(|| "certs_length overflow".to_string())?;
+
+    // Step 3: Random section (echoed nonce)
+    let rand_length = read_u16_be(plaintext, off)? as usize;
+    off += 2;
+    info!(
+        "extract_mac_hash: rand_length = {} at offset 0x{:x}",
+        rand_length, off
+    );
+    off += rand_length;
+
+    // Step 4: Device random
+    let dev_rand_length = read_u16_be(plaintext, off)? as usize;
+    off += 2;
+    info!(
+        "extract_mac_hash: dev_rand_length = {} at offset 0x{:x}",
+        dev_rand_length, off
+    );
+    off += dev_rand_length;
+
+    // Step 5: Skip 1 byte
+    off += 1;
+
+    // Step 6: Signature
+    let sig_length = read_u16_be(plaintext, off)? as usize;
+    off += 2;
+    info!(
+        "extract_mac_hash: sig_length = {} at offset 0x{:x}",
+        sig_length, off
+    );
+    off += sig_length;
+
+    // Step 7: Skip 1 byte
+    off += 1;
+
+    // Step 8: MAC hash
+    let machash_length = read_u16_be(plaintext, off)? as usize;
+    off += 2;
+    info!(
+        "extract_mac_hash: machash_length = {} at offset 0x{:x}",
+        machash_length, off
+    );
+
+    if off + machash_length > plaintext.len() {
+        return Err(format!(
+            "machash extends past plaintext: off={} len={} plaintext_len={}",
+            off,
+            machash_length,
+            plaintext.len()
+        ));
     }
 
-    Err("Could not find MAC hash in device response".into())
+    Ok(plaintext[off..off + machash_length].to_vec())
 }
 
 /// Build the 20-byte confirmation message.
@@ -604,4 +728,87 @@ fn build_confirmation(hash: &[u8]) -> Vec<u8> {
     message[4..20].copy_from_slice(&mac);
 
     message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: parse a hex string into bytes
+    fn h(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// RFC 4493 AES-CMAC test vectors.
+    ///
+    /// All vectors use the same key K = 2b7e151628aed2a6abf7158809cf4f3c.
+    /// We test the two vectors that fall within our aes_cmac function's
+    /// supported input range (empty message, and 16-byte message). The longer
+    /// vectors require multi-block CMAC which our implementation doesn't
+    /// support — and intentionally so, since MTPZ only ever feeds it 4-byte
+    /// and 16-byte messages.
+    #[test]
+    fn rfc4493_test_vector_empty_message() {
+        let key = h("2b7e151628aed2a6abf7158809cf4f3c");
+        let msg: Vec<u8> = Vec::new();
+        let expected = h("bb1d6929e95937287fa37d129b756746");
+        let actual = aes_cmac(&key, &msg);
+        assert_eq!(
+            actual.to_vec(),
+            expected,
+            "RFC 4493 test vector 1 (empty message) failed.\n  expected: {}\n  actual:   {}",
+            hex::encode(&expected),
+            hex::encode(actual)
+        );
+    }
+
+    #[test]
+    fn rfc4493_test_vector_16_byte_message() {
+        let key = h("2b7e151628aed2a6abf7158809cf4f3c");
+        let msg = h("6bc1bee22e409f96e93d7e117393172a");
+        let expected = h("070a16b46b4d4144f79bdd9dd04a287c");
+        let actual = aes_cmac(&key, &msg);
+        assert_eq!(
+            actual.to_vec(),
+            expected,
+            "RFC 4493 test vector 2 (16-byte message) failed.\n  expected: {}\n  actual:   {}",
+            hex::encode(&expected),
+            hex::encode(actual)
+        );
+    }
+
+    /// Verify our cmac_shift matches the RFC 4493 K1/K2 derivation steps.
+    /// From RFC 4493 §2.4 (Subkey Generation Algorithm):
+    /// L  = 7df76b0c1ab899b33e42f047b91b546f   (AES_K(0^128))
+    /// K1 = fbeed618357133667c85e08f7236a8de
+    /// K2 = f7ddac306ae266ccf90bc11ee46d513b
+    #[test]
+    fn rfc4493_subkey_derivation() {
+        let key = h("2b7e151628aed2a6abf7158809cf4f3c");
+        let zeros = [0u8; 16];
+
+        let l = aes_ecb_encrypt_block(&key, &zeros);
+        assert_eq!(
+            hex::encode(&l),
+            "7df76b0c1ab899b33e42f047b91b546f",
+            "L (AES_K(0^128)) does not match RFC 4493"
+        );
+
+        let k1 = cmac_shift(&l);
+        assert_eq!(
+            hex::encode(&k1),
+            "fbeed618357133667c85e08f7236a8de",
+            "K1 does not match RFC 4493"
+        );
+
+        let k2 = cmac_shift(&k1);
+        assert_eq!(
+            hex::encode(&k2),
+            "f7ddac306ae266ccf90bc11ee46d513b",
+            "K2 does not match RFC 4493"
+        );
+    }
 }

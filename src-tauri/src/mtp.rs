@@ -7,9 +7,10 @@
 use bytes::Bytes;
 use futures_util::stream;
 use log::info;
-use mtp_rs::mtp::{DeviceQuirks, MtpDevice, MtpDeviceInfo, NewObjectInfo};
+use mtp_rs::mtp::{MtpDevice, MtpDeviceInfo, NewObjectInfo};
 use mtp_rs::ptp::{
-    unpack_string, unpack_u16, unpack_u32, ObjectFormatCode, ObjectHandle, ObjectPropertyCode,
+    pack_string, unpack_string, unpack_u16, unpack_u32, ObjectFormatCode, ObjectHandle,
+    ObjectPropertyCode,
 };
 use mtp_rs::Progress;
 use serde::{Deserialize, Serialize};
@@ -23,12 +24,8 @@ use crate::mtpz;
 
 // ─── Zune device identification ─────────────────────────────────────────
 // Microsoft Zune VID/PIDs — these devices use non-standard USB descriptors
-// and require split header/data mode + manual folder traversal.
-
-const ZUNE_QUIRKS: DeviceQuirks = DeviceQuirks {
-    split_header_data: true,
-    manual_traversal: true,
-};
+// (so they need to be passed to `list_devices_with_known`) and require
+// split header/data mode on the data phase of `execute_with_send`.
 
 const ZUNE_DEVICES: &[(u16, u16)] = &[
     (0x045E, 0x0710), // Zune
@@ -38,12 +35,19 @@ const ZUNE_DEVICES: &[(u16, u16)] = &[
     (0x045E, 0x0714), // Zune (alt)
 ];
 
+fn is_zune(vendor_id: u16, product_id: u16) -> bool {
+    ZUNE_DEVICES
+        .iter()
+        .any(|&(v, p)| v == vendor_id && p == product_id)
+}
+
 // ─── Standard MTP object property codes for music metadata ────────────────
 // See MTP spec §5.3.12 — these work on any compliant MTP device.
 
 /// Artist name (string)
 const OPC_ARTIST: ObjectPropertyCode = ObjectPropertyCode::Unknown(0xDC46);
-/// Album name (string)
+/// Album name (string) — only readable on track objects; for writes it must
+/// be set on the abstract AbstractAudioAlbum object instead.
 const OPC_ALBUM_NAME: ObjectPropertyCode = ObjectPropertyCode::Unknown(0xDC9A);
 /// Track title / display name
 const OPC_NAME: ObjectPropertyCode = ObjectPropertyCode::Name;
@@ -55,6 +59,13 @@ const OPC_TRACK: ObjectPropertyCode = ObjectPropertyCode::Unknown(0xDC8B);
 const OPC_DURATION: ObjectPropertyCode = ObjectPropertyCode::Unknown(0xDC89);
 /// Use count / play count (u32)
 const OPC_USE_COUNT: ObjectPropertyCode = ObjectPropertyCode::Unknown(0xDC91);
+/// ArtistId — links a track or album object to an Artist object (uint32 handle)
+const OPC_ARTIST_ID: ObjectPropertyCode = ObjectPropertyCode::Unknown(0xDAB9);
+
+/// Object format for an Artist metadata object (Zune extension).
+const OFC_ARTIST: u16 = 0xB218;
+/// Object format for an AbstractAudioAlbum object (standard MTP).
+const OFC_ABSTRACT_AUDIO_ALBUM: u16 = 0xBA03;
 
 // ─── Data types for Tauri serialization ───────────────────────────────────
 
@@ -119,10 +130,24 @@ pub struct SendTrackProgress {
 
 // ─── Shared device connection ─────────────────────────────────────────────
 
+/// Per-album state we maintain across uploads in the same session.
+#[derive(Default, Clone)]
+struct AlbumGroup {
+    artist_handle: ObjectHandle,
+    album_handle: ObjectHandle,
+    track_handles: Vec<ObjectHandle>,
+}
+
 /// Holds an open MTP device connection so we don't re-open for every command.
 struct DeviceConnection {
     device: MtpDevice,
     serial: String,
+    vendor_id: u16,
+    product_id: u16,
+    /// Map of artist name → artist object handle (created on demand)
+    artist_handles: std::collections::HashMap<String, ObjectHandle>,
+    /// Map of "artist|||album" → AlbumGroup (created on demand)
+    album_groups: std::collections::HashMap<String, AlbumGroup>,
 }
 
 // We use a simple mutex-guarded Option for connection caching.
@@ -132,27 +157,51 @@ fn device_holder() -> &'static Arc<Mutex<Option<DeviceConnection>>> {
     DEVICE.get_or_init(|| Arc::new(Mutex::new(None)))
 }
 
-/// Get or open a device connection by serial number.
-async fn get_device(serial: &str) -> Result<MtpDevice, String> {
+/// Get or open a device connection by serial number. Returns the open
+/// device along with its USB vid/pid so callers can dispatch device-specific
+/// behavior (e.g., Zune-only upload paths).
+async fn get_device(serial: &str) -> Result<(MtpDevice, u16, u16), String> {
     let holder = device_holder();
     let mut guard = holder.lock().await;
 
     // Reuse existing connection if same device
     if let Some(conn) = guard.as_ref() {
         if conn.serial == serial {
-            return Ok(conn.device.clone());
+            return Ok((conn.device.clone(), conn.vendor_id, conn.product_id));
         }
     }
 
-    // Open new connection — register Zune devices so they get the right quirks
-    let mut builder = MtpDevice::builder();
-    for &(vid, pid) in ZUNE_DEVICES {
-        builder = builder.register_device(vid, pid, ZUNE_QUIRKS.clone());
-    }
-    let device = builder
+    // Look up vid/pid via mtp-rs discovery (using the same known-devices list
+    // we pass to the open call) so we can dispatch device-specific behavior
+    // after open. mtp-rs handles enumeration, the macOS configuration quirk,
+    // and the permissive interface scan internally.
+    let (vid, pid) = MtpDevice::list_devices_with_known(ZUNE_DEVICES)
+        .map_err(|e| format!("Failed to enumerate MTP devices: {}", e))?
+        .into_iter()
+        .find(|d| d.serial_number.as_deref() == Some(serial))
+        .map(|d| (d.vendor_id, d.product_id))
+        .ok_or_else(|| format!("No MTP device with serial {}", serial))?;
+
+    let device = MtpDevice::builder()
+        .known_devices(ZUNE_DEVICES)
         .open_by_serial(serial)
         .await
-        .map_err(|e| format!("Failed to open device: {}", e))?;
+        .map_err(|e| {
+            if e.is_exclusive_access() {
+                "Another application has exclusive access to this device. \
+                 Close other apps that might be using it (e.g. Image Capture, \
+                 Android File Transfer) and try again."
+                    .to_string()
+            } else {
+                format!("Failed to open MTP session: {}", e)
+            }
+        })?;
+
+    // Apply Zune quirk: data container header and payload must be sent as
+    // separate USB bulk transfers in execute_with_send.
+    if is_zune(vid, pid) {
+        device.session().set_split_header_data(true);
+    }
 
     info!(
         "Opened MTP device: {} {}",
@@ -169,9 +218,13 @@ async fn get_device(serial: &str) -> Result<MtpDevice, String> {
     *guard = Some(DeviceConnection {
         device: device.clone(),
         serial: serial.to_string(),
+        vendor_id: vid,
+        product_id: pid,
+        artist_handles: std::collections::HashMap::new(),
+        album_groups: std::collections::HashMap::new(),
     });
 
-    Ok(device)
+    Ok((device, vid, pid))
 }
 
 // ─── Property reading helpers ─────────────────────────────────────────────
@@ -234,7 +287,7 @@ pub async fn mtp_detect_devices() -> Result<Vec<MtpDeviceDesc>, String> {
 
 #[tauri::command]
 pub async fn mtp_get_tracks(serial_number: String) -> Result<Vec<MtpTrack>, String> {
-    let device = get_device(&serial_number).await?;
+    let (device, _vid, _pid) = get_device(&serial_number).await?;
 
     let storages = device
         .storages()
@@ -315,7 +368,7 @@ pub async fn mtp_send_track(
     event: SendTrackRequest,
     app_handle: tauri::AppHandle,
 ) -> Result<MtpTrack, String> {
-    let device = get_device(&event.serial_number).await?;
+    let (device, _vid, _pid) = get_device(&event.serial_number).await?;
 
     let file_path = Path::new(&event.file_path);
     let file_meta = std::fs::metadata(file_path)
@@ -342,7 +395,7 @@ pub async fn mtp_send_track(
 
     // Find or create a Music folder to upload into.
     // Many devices (especially Android) reject uploads to the storage root.
-    let music_folder = find_or_create_music_folder(&storage).await?;
+    let music_folder = find_or_create_music_folder(&device, &storage).await?;
 
     let obj_info = NewObjectInfo::file(filename, file_size);
 
@@ -377,6 +430,23 @@ pub async fn mtp_send_track(
         set_track_metadata(&device, handle, &event).await;
     }
 
+    // Maintain abstract Artist/AbstractAudioAlbum objects for library grouping.
+    // The Zune (and other Microsoft media devices) require these to display
+    // tracks under the right artist/album in the UI; per-track string props
+    // alone aren't enough. Errors are logged but don't fail the upload.
+    if let Err(e) = ensure_album_grouping(
+        &device,
+        &storage,
+        handle,
+        &event.artist,
+        &event.album,
+        &event.serial_number,
+    )
+    .await
+    {
+        info!("Album grouping failed (track was uploaded but won't appear in library view): {}", e);
+    }
+
     let result = MtpTrack {
         handle: handle.0,
         title: event.title,
@@ -394,17 +464,358 @@ pub async fn mtp_send_track(
     Ok(result)
 }
 
+/// Cleanly close the MTP session for a connected device. The Zune (and other
+/// MTPZ devices) will otherwise remain in their "Syncing" state until the USB
+/// cable is physically unplugged. The frontend should call this when the user
+/// disconnects a device, switches devices, or before the app exits.
+#[tauri::command]
+pub async fn mtp_disconnect(serial_number: String) -> Result<(), String> {
+    let holder = device_holder();
+    let mut guard = holder.lock().await;
+
+    // Only act if the cached connection matches the requested serial.
+    let cached_serial = guard.as_ref().map(|c| c.serial.clone());
+    if cached_serial.as_deref() != Some(serial_number.as_str()) {
+        return Ok(());
+    }
+
+    if let Some(conn) = guard.as_ref() {
+        // Send CloseSession (0x1003) directly via the low-level session API.
+        // We can't call MtpDevice::close() because it consumes self and our
+        // Arc<MtpDevice> has multiple cloned references in the cache.
+        let session = conn.device.session();
+        let close_op = mtp_rs::ptp::OperationCode::CloseSession;
+        if let Err(e) = session.execute(close_op, &[]).await {
+            info!("CloseSession failed (ignoring): {}", e);
+        } else {
+            info!("MTP session closed for {}", serial_number);
+        }
+    }
+
+    // Drop the cached connection so the next access reopens the device.
+    *guard = None;
+    Ok(())
+}
+
+/// After a track is uploaded, ensure that abstract Artist + AbstractAudioAlbum
+/// objects exist for it on the device, link the new track to them, and re-issue
+/// SetObjectReferences so the album's track list is current. Without this, the
+/// Zune UI shows tracks as "Unknown Artist" / "Unknown Album" even though the
+/// per-track string properties are set correctly — the device's library view
+/// is keyed off the abstract album/artist objects, not off the track props.
+///
+/// This mirrors NiceBeard's `_createAlbumObjects` flow but happens incrementally
+/// (per track upload) instead of in a batch at the end of the sync.
+async fn ensure_album_grouping(
+    device: &MtpDevice,
+    storage: &mtp_rs::mtp::Storage,
+    track_handle: ObjectHandle,
+    artist_name: &str,
+    album_name: &str,
+    serial: &str,
+) -> Result<(), String> {
+    // Skip if either is empty/Unknown — there's nothing meaningful to group by.
+    if artist_name.is_empty() || album_name.is_empty() {
+        return Ok(());
+    }
+
+    let session = device.session();
+    let storage_id = storage.id();
+
+    // ── 1. Get-or-create the Artist object ─────────────────────────────
+    let artist_handle = {
+        let holder = device_holder();
+        let mut guard = holder.lock().await;
+        let conn = guard
+            .as_mut()
+            .filter(|c| c.serial == serial)
+            .ok_or_else(|| "Cached device connection missing".to_string())?;
+
+        if let Some(h) = conn.artist_handles.get(artist_name) {
+            *h
+        } else {
+            // Drop the lock before doing slow MTP operations.
+            drop(guard);
+
+            let artist_filename = format!("{}.art", artist_name);
+            let h = send_abstract_object(
+                session,
+                storage_id,
+                ObjectHandle(0),
+                OFC_ARTIST,
+                &artist_filename,
+            )
+            .await
+            .map_err(|e| format!("Failed to create Artist object: {}", e))?;
+
+            // Set the Name property on the artist object.
+            if let Err(e) = session
+                .set_object_prop_value(h, OPC_NAME, &pack_string(artist_name))
+                .await
+            {
+                info!("Could not set artist Name property: {}", e);
+            }
+
+            // Cache it.
+            let holder = device_holder();
+            let mut guard = holder.lock().await;
+            if let Some(conn) = guard.as_mut().filter(|c| c.serial == serial) {
+                conn.artist_handles.insert(artist_name.to_string(), h);
+            }
+
+            info!("Created Artist object \"{}\" handle={}", artist_name, h.0);
+            h
+        }
+    };
+
+    // ── 2. Get-or-create the AbstractAudioAlbum object ─────────────────
+    let group_key = format!("{}|||{}", artist_name, album_name);
+
+    let (album_handle, all_track_handles) = {
+        let holder = device_holder();
+        let mut guard = holder.lock().await;
+        let conn = guard
+            .as_mut()
+            .filter(|c| c.serial == serial)
+            .ok_or_else(|| "Cached device connection missing".to_string())?;
+
+        if let Some(group) = conn.album_groups.get_mut(&group_key) {
+            // Existing album — append the new track.
+            group.track_handles.push(track_handle);
+            (group.album_handle, group.track_handles.clone())
+        } else {
+            // Need to create the album. Drop the lock before slow ops.
+            drop(guard);
+
+            let album_filename = format!("{}--{}.alb", artist_name, album_name);
+            let album_handle = send_abstract_object(
+                session,
+                storage_id,
+                ObjectHandle(0),
+                OFC_ABSTRACT_AUDIO_ALBUM,
+                &album_filename,
+            )
+            .await
+            .map_err(|e| format!("Failed to create Album object: {}", e))?;
+
+            // Set Name + Artist (string) + ArtistId on the album.
+            if let Err(e) = session
+                .set_object_prop_value(album_handle, OPC_NAME, &pack_string(album_name))
+                .await
+            {
+                info!("Could not set album Name: {}", e);
+            }
+            if let Err(e) = session
+                .set_object_prop_value(album_handle, OPC_ARTIST, &pack_string(artist_name))
+                .await
+            {
+                info!("Could not set album Artist: {}", e);
+            }
+            if let Err(e) = session
+                .set_object_prop_value(
+                    album_handle,
+                    OPC_ARTIST_ID,
+                    &artist_handle.0.to_le_bytes(),
+                )
+                .await
+            {
+                info!("Could not set album ArtistId: {}", e);
+            }
+
+            // Insert the new group into the cache.
+            let holder = device_holder();
+            let mut guard = holder.lock().await;
+            if let Some(conn) = guard.as_mut().filter(|c| c.serial == serial) {
+                conn.album_groups.insert(
+                    group_key.clone(),
+                    AlbumGroup {
+                        artist_handle,
+                        album_handle,
+                        track_handles: vec![track_handle],
+                    },
+                );
+            }
+
+            info!(
+                "Created AbstractAudioAlbum \"{}\" by \"{}\" handle={}",
+                album_name, artist_name, album_handle.0
+            );
+
+            (album_handle, vec![track_handle])
+        }
+    };
+
+    // ── 3. Set ArtistId on the new track itself ────────────────────────
+    if let Err(e) = session
+        .set_object_prop_value(track_handle, OPC_ARTIST_ID, &artist_handle.0.to_le_bytes())
+        .await
+    {
+        info!("Could not set ArtistId on track: {}", e);
+    }
+
+    // ── 4. Update SetObjectReferences on the album to include all tracks ──
+    // The Zune library view scans these references to populate the album.
+    // We re-issue this on every new track because we don't know in advance
+    // when the user will stop adding to this album.
+    if let Err(e) = send_set_object_references(session, album_handle, &all_track_handles).await {
+        info!("Could not set object references for album: {}", e);
+    }
+
+    Ok(())
+}
+
+/// Create an abstract (zero-data) object on the device by manually marshalling
+/// the SendObjectInfo dataset. We can't use `Storage::upload` for this because
+/// mtp-rs's `ObjectInfo::to_bytes` writes a 19-field dataset including a
+/// trailing `Keywords` string field, which the Zune rejects with
+/// `InvalidObjectFormatCode (0x2016)` for non-file formats like Artist
+/// (0xB218) and AbstractAudioAlbum (0xBA03). NiceBeard's working implementation
+/// uses the standard MTP 1.1 18-field layout (no Keywords). We mirror that here.
+///
+/// Wire format (MTP 1.1 §5.5.4):
+///   command params: [storage_id, parent_handle]
+///   data phase: 52-byte fixed header + filename string + creationDate + modificationDate
+async fn send_abstract_object(
+    session: &mtp_rs::ptp::PtpSession,
+    storage_id: mtp_rs::ptp::StorageId,
+    parent_handle: ObjectHandle,
+    object_format: u16,
+    filename: &str,
+) -> Result<ObjectHandle, String> {
+    use mtp_rs::ptp::OperationCode;
+
+    // Build the 18-field dataset.
+    let filename_bytes = pack_string(filename);
+    let empty_string = [0x00u8]; // MTP empty string = single zero byte
+
+    let fixed_size = 52;
+    let total_size = fixed_size + filename_bytes.len() + empty_string.len() * 2;
+    let mut buf = Vec::with_capacity(total_size);
+
+    // 1. StorageID (u32)
+    buf.extend_from_slice(&storage_id.0.to_le_bytes());
+    // 2. ObjectFormat (u16)
+    buf.extend_from_slice(&object_format.to_le_bytes());
+    // 3. ProtectionStatus (u16) = 0
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    // 4. ObjectCompressedSize (u32) = 0 (abstract object has no data)
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // 5. ThumbFormat (u16) = 0
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    // 6. ThumbCompressedSize (u32) = 0
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // 7. ThumbPixWidth (u32) = 0
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // 8. ThumbPixHeight (u32) = 0
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // 9. ImagePixWidth (u32) = 0
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // 10. ImagePixHeight (u32) = 0
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // 11. ImageBitDepth (u32) = 0
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // 12. ParentObject (u32)
+    buf.extend_from_slice(&parent_handle.0.to_le_bytes());
+    // 13. AssociationType (u16) = 0
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    // 14. AssociationDesc (u32) = 0
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // 15. SequenceNumber (u32) = 0
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // 16. Filename (MTP string)
+    buf.extend_from_slice(&filename_bytes);
+    // 17. CreationDate (empty MTP string)
+    buf.extend_from_slice(&empty_string);
+    // 18. ModificationDate (empty MTP string)
+    buf.extend_from_slice(&empty_string);
+    // (NO Keywords field — that's where mtp-rs and the Zune disagree)
+
+    // Send SendObjectInfo command + data phase.
+    let response = session
+        .execute_with_send(
+            OperationCode::SendObjectInfo,
+            &[storage_id.0, parent_handle.0],
+            &buf,
+        )
+        .await
+        .map_err(|e| format!("SendObjectInfo failed: {}", e))?;
+
+    let resp_code = u16::from(response.code);
+    if resp_code != 0x2001 {
+        return Err(format!(
+            "SendObjectInfo returned 0x{:04x} for format 0x{:04x}",
+            resp_code, object_format
+        ));
+    }
+
+    // Response params: [storage_id, parent_handle, new_object_handle]
+    let new_handle_raw = *response
+        .params
+        .get(2)
+        .ok_or_else(|| "SendObjectInfo response missing new handle param".to_string())?;
+    let new_handle = ObjectHandle(new_handle_raw);
+
+    // Send SendObject with empty data — required by the protocol even for
+    // zero-byte objects.
+    session
+        .execute_with_send(OperationCode::SendObject, &[], &[])
+        .await
+        .map_err(|e| format!("SendObject (empty) failed: {}", e))?;
+
+    Ok(new_handle)
+}
+
+/// Send SetObjectReferences (PTP opcode 0x9811) directly via the low-level
+/// session API. mtp-rs's high-level Storage API doesn't expose this operation,
+/// so we marshal the payload ourselves.
+///
+/// Wire format (per MTP 1.1 §5.5.7):
+///   command params: [object_handle]
+///   data phase: u32 array_length, then N × u32 reference handles, all LE
+async fn send_set_object_references(
+    session: &mtp_rs::ptp::PtpSession,
+    object_handle: ObjectHandle,
+    references: &[ObjectHandle],
+) -> Result<(), String> {
+    use mtp_rs::ptp::OperationCode;
+
+    let mut payload = Vec::with_capacity(4 + references.len() * 4);
+    payload.extend_from_slice(&(references.len() as u32).to_le_bytes());
+    for r in references {
+        payload.extend_from_slice(&r.0.to_le_bytes());
+    }
+
+    session
+        .execute_with_send(
+            OperationCode::Unknown(0x9811),
+            &[object_handle.0],
+            &payload,
+        )
+        .await
+        .map_err(|e| format!("SetObjectReferences failed: {}", e))?;
+
+    Ok(())
+}
+
 /// Find an existing "Music" folder in the storage root, or create one.
 async fn find_or_create_music_folder(
+    device: &MtpDevice,
     storage: &mtp_rs::mtp::Storage,
 ) -> Result<ObjectHandle, String> {
-    let root_objects = storage
-        .list_objects(None)
+    // Walk root manually, skipping any handles that fail GetObjectInfo.
+    // The Zune exposes abstract objects in root (playlists etc.) that can't
+    // be queried — using `storage.list_objects(None)` would fail the whole
+    // call on the first such object.
+    let handles = device
+        .get_object_handles(storage.id(), None)
         .await
-        .map_err(|e| format!("Failed to list root objects: {}", e))?;
+        .map_err(|e| format!("Failed to list root handles: {}", e))?;
 
-    // Look for an existing Music folder (case-insensitive)
-    for obj in &root_objects {
+    for handle in handles {
+        let obj = match storage.get_object_info(handle).await {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
         if obj.is_folder() && obj.filename.eq_ignore_ascii_case("Music") {
             info!("Using existing Music folder: handle={}", obj.handle.0);
             return Ok(obj.handle);
@@ -428,10 +839,13 @@ async fn set_track_metadata(device: &MtpDevice, handle: ObjectHandle, req: &Send
 
     let session = device.session();
 
+    // Per-track properties only. AlbumName (0xDC9A) and AlbumArtist (0xDC9B)
+    // are intentionally NOT set here — the Zune rejects those on track objects
+    // with AccessDenied. They belong on the abstract AbstractAudioAlbum object,
+    // which `ensure_album_grouping` creates and populates after this call.
     let props: Vec<(ObjectPropertyCode, Vec<u8>)> = vec![
         (OPC_NAME, pack_string(&req.title)),
         (OPC_ARTIST, pack_string(&req.artist)),
-        (OPC_ALBUM_NAME, pack_string(&req.album)),
         (OPC_GENRE, pack_string(&req.genre)),
         (OPC_TRACK, req.track_number.to_le_bytes().to_vec()),
         (OPC_DURATION, req.duration_ms.to_le_bytes().to_vec()),
@@ -443,3 +857,4 @@ async fn set_track_metadata(device: &MtpDevice, handle: ObjectHandle, req: &Send
         }
     }
 }
+
