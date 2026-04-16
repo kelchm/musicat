@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 use crate::stem_separator::StemProcessState;
 
 mod beets;
+mod canonical_track;
 mod constants;
 mod dsp;
 mod equalizer;
@@ -697,7 +698,12 @@ fn main() {
             beets::get_albums_by_id,
             mtp::mtp_detect_devices,
             mtp::mtp_get_tracks,
-            mtp::mtp_send_track
+            mtp::mtp_send_track,
+            canonical_track::resolve_canonical_track,
+            canonical_track::get_canonical_track,
+            canonical_track::get_track_sources,
+            canonical_track::find_canonical_by_source,
+            canonical_track::batch_resolve_songs
         ])
         .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             info!("{}, {argv:?}, {cwd}", app.package_info().name);
